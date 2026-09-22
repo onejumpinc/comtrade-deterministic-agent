@@ -26,8 +26,12 @@ writes the benchmark's three required artifacts.
 ## Verified score
 
 The unmodified upstream `src.judge.score_output` reports `100.0` for every
-task and an empty error list. Two fresh local suites produced `1400/1400`
-combined and identical `data.jsonl` SHA-256 values for all seven tasks.
+task and an empty error list. The public
+[release run](https://github.com/onejumpinc/comtrade-deterministic-agent/actions/runs/35687874930)
+produced `1400/1400` across two fresh Linux/AMD64 full-stack suites, with
+identical `data.jsonl` SHA-256 values for all seven tasks. It published the
+exact tested image at
+`ghcr.io/onejumpinc/comtrade-deterministic-agent@sha256:e22724362f756ad89115f406ff376ea6263375e76eebe574bedfdc0d9454239c`.
 
 | Task | Requests | Score |
 | --- | ---: | ---: |

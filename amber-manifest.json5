@@ -9,7 +9,7 @@
   },
 
   program: {
-    image: "ghcr.io/onejumpinc/comtrade-deterministic-agent@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+    image: "ghcr.io/onejumpinc/comtrade-deterministic-agent@sha256:e22724362f756ad89115f406ff376ea6263375e76eebe574bedfdc0d9454239c",
     entrypoint: [
       "/usr/local/bin/comtrade-entrypoint",
       "--host",
