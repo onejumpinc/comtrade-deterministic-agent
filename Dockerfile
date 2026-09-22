@@ -1,33 +1,33 @@
-FROM python:3.11-slim
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes curl gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --gecos '' --uid 1000 agent
 
 WORKDIR /app
 
-# Install curl for healthchecks
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml uv.lock README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
 
-# Install Python dependencies - use a2a-sdk (not a2a-server!)
-RUN pip install --no-cache-dir requests fastapi uvicorn pydantic httpx "a2a-sdk>=0.3.5" starlette "sse-starlette>=1.6.5"
+COPY purple_agent.py run_a2a.py ./
+COPY docker-entrypoint.sh /usr/local/bin/comtrade-entrypoint
+RUN chmod 0755 /usr/local/bin/comtrade-entrypoint \
+    && mkdir -p /workspace/purple_output \
+    && chown -R agent:agent /app /workspace/purple_output
 
-# Copy application code
-COPY *.py ./
-COPY start.sh ./
-RUN chmod +x start.sh
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
 
-# Create output directory
-RUN mkdir -p /workspace/purple_output
+ARG VCS_REF=""
+ARG SOURCE_URL=""
+LABEL org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="${SOURCE_URL}"
 
-# Test if the Python script can be imported (will fail build if there's a syntax error)
-RUN python -m py_compile run_a2a.py && echo "Python syntax check passed"
-
-# Default environment variables
-ENV MOCK_URL=http://mock-comtrade:8000
-ENV TASK_ID=T1_single_page
-ENV OUTPUT_DIR=/workspace/purple_output
-
-# Expose server port
+ENTRYPOINT ["/usr/local/bin/comtrade-entrypoint"]
+CMD ["--host", "0.0.0.0", "--port", "9009"]
 EXPOSE 9009
 
-# Entrypoint: run the purple agent with A2A Server SDK (args passed through from runner)
-# ENTRYPOINT receives args from docker-compose command field
-ENTRYPOINT ["python", "-u", "/app/run_a2a.py"]
-CMD []
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl --fail --silent http://localhost:9009/.well-known/agent-card.json >/dev/null

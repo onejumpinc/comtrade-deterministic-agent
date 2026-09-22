@@ -1,0 +1,507 @@
+name: Validate and publish deterministic ComtradeBench agent
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/test-and-publish.yml"
+      - ".dockerignore"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "purple_agent.py"
+      - "run_a2a.py"
+      - "pyproject.toml"
+      - "tests/**"
+      - "uv.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: comtrade-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GREEN_IMAGE: ghcr.io/yonghongzhang-io/green-comtrade-bench-v2@sha256:a4efb6cf1afd06ded07ffa34223fbdcd4d735188f6efbbdb6b78694981a8cbf0
+  MOCK_IMAGE: ghcr.io/yonghongzhang-io/green-comtrade-bench-v2-mock@sha256:517485a83a13edd5591673422d66e4b509b3163f841473f4afbebdfaa9cfb634
+  CLIENT_IMAGE: ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e
+  IMAGE_NAME: ghcr.io/onejumpinc/comtrade-deterministic-agent
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.1"
+          enable-cache: true
+
+      - name: Verify model-free runtime and run unit tests
+        run: |
+          test "$(grep -c '/configure' purple_agent.py || true)" = "0"
+          if grep -Eq 'T[1-7]_[a-z_0-9]+' purple_agent.py run_a2a.py; then
+            echo "Runtime contains a benchmark task table" >&2
+            exit 1
+          fi
+          if grep -Eq '2345|S[0-9]{7}' purple_agent.py run_a2a.py; then
+            echo "Runtime contains an expected answer or row count" >&2
+            exit 1
+          fi
+          uv sync --frozen --extra test
+          uv run pytest -q
+          uv run python -m compileall -q purple_agent.py run_a2a.py tests
+
+      - name: Build tested Linux/AMD64 image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg SOURCE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --tag comtrade-deterministic-agent:test \
+            .
+          test "$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            comtrade-deterministic-agent:test)" = "${GITHUB_SHA}"
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' \
+            comtrade-deterministic-agent:test)" = '["/usr/local/bin/comtrade-entrypoint"]'
+          docker run --rm --entrypoint /bin/sh \
+            comtrade-deterministic-agent:test -c '
+              test ! -e /app/tasks.py
+              test ! -e /app/mock_service
+              test ! -e /app/fixtures
+              test "$(id -u agent)" = 1000
+            '
+
+      - name: Run two fresh exact seven-task A2A assessments
+        id: exact
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker logs comtrade-purple > "${RUNNER_TEMP}/purple-cleanup.log" 2>&1 || true
+            docker logs comtrade-green > "${RUNNER_TEMP}/green-cleanup.log" 2>&1 || true
+            docker logs comtrade-mock > "${RUNNER_TEMP}/mock-cleanup.log" 2>&1 || true
+            docker rm -f comtrade-purple comtrade-green comtrade-mock >/dev/null 2>&1 || true
+            docker volume rm comtrade-purple-output >/dev/null 2>&1 || true
+            docker network rm comtrade-validation >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          participant_image_id=$(docker image inspect --format '{{.Id}}' \
+            comtrade-deterministic-agent:test)
+
+          for run_number in 1 2; do
+            run_dir="${RUNNER_TEMP}/comtrade-run-${run_number}"
+            mkdir -p "${run_dir}/output"
+            chmod 777 "${run_dir}/output"
+            cat > "${run_dir}/scenario.toml" <<'SCENARIO'
+          [green_agent]
+          endpoint = "http://green-agent:9009"
+
+          [[participants]]
+          role = "purple-comtrade-baseline-v2"
+          endpoint = "http://purple-comtrade-baseline-v2:9009"
+
+          [config]
+          tasks = [
+            "T1_single_page",
+            "T2_multi_page",
+            "T3_duplicates",
+            "T4_rate_limit_429",
+            "T5_server_error_500",
+            "T6_page_drift",
+            "T7_totals_trap",
+          ]
+          SCENARIO
+
+            docker network create comtrade-validation
+            docker volume create comtrade-purple-output
+
+            docker run --detach \
+              --name comtrade-mock \
+              --network comtrade-validation \
+              --network-alias mock-comtrade \
+              --publish 18000:8000 \
+              "${MOCK_IMAGE}"
+
+            ready=false
+            for _ in $(seq 1 90); do
+              if curl --fail --silent http://127.0.0.1:18000/docs >/dev/null; then
+                ready=true
+                break
+              fi
+              sleep 1
+            done
+            test "${ready}" = true
+
+            docker run --detach \
+              --name comtrade-purple \
+              --network comtrade-validation \
+              --network-alias purple-comtrade-baseline-v2 \
+              --volume comtrade-purple-output:/workspace/purple_output \
+              --publish 19090:9009 \
+              comtrade-deterministic-agent:test \
+              --host 0.0.0.0 \
+              --port 9009 \
+              --card-url http://purple-comtrade-baseline-v2:9009
+
+            docker run --detach \
+              --name comtrade-green \
+              --network comtrade-validation \
+              --network-alias green-agent \
+              --volume comtrade-purple-output:/workspace/purple_output \
+              --env MOCK_URL=http://mock-comtrade:8000 \
+              --env PURPLE_OUTPUT_ROOT=/workspace/purple_output \
+              --publish 19091:9009 \
+              "${GREEN_IMAGE}" \
+              --host 0.0.0.0 \
+              --port 9009 \
+              --card-url http://green-agent:9009
+
+            for url in \
+              http://127.0.0.1:19090/.well-known/agent-card.json \
+              http://127.0.0.1:19091/.well-known/agent-card.json; do
+              ready=false
+              for _ in $(seq 1 90); do
+                if curl --fail --silent "${url}" >/dev/null; then
+                  ready=true
+                  break
+                fi
+                sleep 1
+              done
+              test "${ready}" = true
+            done
+
+            docker exec --user 0 comtrade-purple sh -c \
+              "awk '/^Uid:/{print \$2}' /proc/1/status" \
+              > "${run_dir}/participant-process-uid.txt"
+            test "$(cat "${run_dir}/participant-process-uid.txt")" = "1000"
+
+            docker run --rm \
+              --network comtrade-validation \
+              --volume "${run_dir}/scenario.toml:/app/scenario.toml:ro" \
+              --volume "${run_dir}/output:/app/output" \
+              "${CLIENT_IMAGE}" \
+              scenario.toml output/results.json
+
+            docker logs comtrade-purple > "${run_dir}/purple.log" 2>&1
+            docker logs comtrade-green > "${run_dir}/green.log" 2>&1
+            docker logs comtrade-mock > "${run_dir}/mock.log" 2>&1
+            docker cp comtrade-purple:/workspace/purple_output \
+              "${run_dir}/purple_output"
+            printf '%s\n' "${participant_image_id}" \
+              > "${run_dir}/participant-image-id.txt"
+
+            RUN_DIR="${run_dir}" python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          def fail(message):
+              sys.exit(f"Exact gate failed: {message}")
+
+          run_dir = Path(os.environ["RUN_DIR"])
+          with (run_dir / "output/results.json").open() as result_file:
+              payload = json.load(
+                  result_file,
+                  parse_constant=lambda constant: fail(
+                      f"non-finite result number {constant}"
+                  ),
+              )
+          if not isinstance(payload, dict) or set(payload) != {"participants", "results"}:
+              fail(f"unexpected result payload keys={sorted(payload)}")
+          if payload["participants"] != {}:
+              fail(f"local evidence unexpectedly has participants={payload['participants']!r}")
+          if not isinstance(payload["results"], list) or len(payload["results"]) != 1:
+              fail(f"expected one assessment result: {payload['results']!r}")
+          task_results = payload["results"][0]
+          if not isinstance(task_results, list) or len(task_results) != 7:
+              fail(f"expected seven task results: {task_results!r}")
+
+          expected_tasks = [
+              "T1_single_page",
+              "T2_multi_page",
+              "T3_duplicates",
+              "T4_rate_limit_429",
+              "T5_server_error_500",
+              "T6_page_drift",
+              "T7_totals_trap",
+          ]
+          expected_rows = {
+              "T1_single_page": 800,
+              "T2_multi_page": 2345,
+              "T3_duplicates": 25,
+              "T4_rate_limit_429": 30,
+              "T5_server_error_500": 30,
+              "T6_page_drift": 36,
+              "T7_totals_trap": 750,
+          }
+          expected_requests = {
+              "T1_single_page": 1,
+              "T2_multi_page": 5,
+              "T3_duplicates": 3,
+              "T4_rate_limit_429": 4,
+              "T5_server_error_500": 4,
+              "T6_page_drift": 2,
+              "T7_totals_trap": 3,
+          }
+          expected_breakdown = {
+              "correctness": 30.0,
+              "completeness": 15.0,
+              "robustness": 15.0,
+              "efficiency": 15.0,
+              "data_quality": 15.0,
+              "observability": 10.0,
+          }
+          if [result.get("task_id") for result in task_results] != expected_tasks:
+              fail(f"task order/ids={[result.get('task_id') for result in task_results]!r}")
+
+          hashes = {}
+          output_root = run_dir / "purple_output"
+          for result in task_results:
+              task_id = result["task_id"]
+              if result.get("score_total") != 100.0:
+                  fail(f"{task_id} score={result.get('score_total')!r}")
+              if result.get("score_breakdown") != expected_breakdown:
+                  fail(f"{task_id} breakdown={result.get('score_breakdown')!r}")
+              if result.get("errors") != [] or "error" in result:
+                  fail(f"{task_id} errors={result.get('errors')!r}")
+              details = result.get("details")
+              if not isinstance(details, dict):
+                  fail(f"{task_id} details={details!r}")
+              if details.get("row_count_actual") != expected_rows[task_id]:
+                  fail(f"{task_id} row_count_actual={details.get('row_count_actual')!r}")
+              if details.get("row_count_declared") != expected_rows[task_id]:
+                  fail(f"{task_id} row_count_declared={details.get('row_count_declared')!r}")
+              if details.get("request_count") != expected_requests[task_id]:
+                  fail(f"{task_id} request_count={details.get('request_count')!r}")
+              if details.get("dedup_total_rows") != expected_rows[task_id]:
+                  fail(f"{task_id} dedup_total_rows={details.get('dedup_total_rows')!r}")
+              if details.get("dedup_unique_rows") != expected_rows[task_id]:
+                  fail(f"{task_id} dedup_unique_rows={details.get('dedup_unique_rows')!r}")
+              if details.get("governance_rules_applied"):
+                  fail(f"{task_id} governance gate={details['governance_rules_applied']!r}")
+
+              task_dir = output_root / task_id
+              required_files = {"data.jsonl", "metadata.json", "run.log"}
+              if not required_files.issubset(path.name for path in task_dir.iterdir()):
+                  fail(f"{task_id} is missing required output files")
+              data_path = task_dir / "data.jsonl"
+              metadata_path = task_dir / "metadata.json"
+              log_path = task_dir / "run.log"
+              data_hash = hashlib.sha256(data_path.read_bytes()).hexdigest()
+              metadata_hash = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
+              if data_hash != details.get("data_sha256"):
+                  fail(f"{task_id} scorer data hash mismatch")
+              if metadata_hash != details.get("metadata_sha256"):
+                  fail(f"{task_id} scorer metadata hash mismatch")
+              hashes[task_id] = data_hash
+
+              metadata = json.loads(metadata_path.read_text())
+              if metadata.get("task_id") != task_id:
+                  fail(f"{task_id} metadata task_id={metadata.get('task_id')!r}")
+              if metadata.get("row_count") != expected_rows[task_id]:
+                  fail(f"{task_id} metadata row_count={metadata.get('row_count')!r}")
+              if metadata.get("request_count") != expected_requests[task_id]:
+                  fail(f"{task_id} metadata request_count={metadata.get('request_count')!r}")
+              if metadata.get("output_hashes", {}).get("data_sha256") != data_hash:
+                  fail(f"{task_id} participant data hash mismatch")
+              if len(metadata.get("schema", [])) < 9:
+                  fail(f"{task_id} schema={metadata.get('schema')!r}")
+              row_count = sum(1 for line in data_path.read_text().splitlines() if line)
+              if row_count != expected_rows[task_id]:
+                  fail(f"{task_id} JSONL rows={row_count}")
+              log_text = log_path.read_text()
+              if "event=complete" not in log_text or "errors=0" not in log_text:
+                  fail(f"{task_id} completion evidence missing")
+              if task_id == "T4_rate_limit_429" and "status=429" not in log_text:
+                  fail("T4 lacks real 429 retry evidence")
+              if task_id == "T5_server_error_500" and "status=500" not in log_text:
+                  fail("T5 lacks real 500 retry evidence")
+              if task_id not in {"T4_rate_limit_429", "T5_server_error_500"}:
+                  if re.search(r"status=(?:429|500)", log_text):
+                      fail(f"{task_id} falsely reports an HTTP fault")
+
+          mock_log = (run_dir / "mock.log").read_text()
+          record_requests = [
+              line for line in mock_log.splitlines() if 'GET /records' in line
+          ]
+          if len(record_requests) != 22:
+              fail(f"mock recorded {len(record_requests)} data requests, expected 22")
+          if sum(' 429 ' in line for line in record_requests) != 1:
+              fail("mock did not record exactly one 429")
+          if sum(' 500 ' in line for line in record_requests) != 1:
+              fail("mock did not record exactly one 500")
+          if sum('POST /configure' in line for line in mock_log.splitlines()) != 7:
+              fail("green did not configure exactly seven tasks")
+
+          purple_log = (run_dir / "purple.log").read_text()
+          if purple_log.count("event=request_started") != 22:
+              fail("participant did not log exactly 22 real data requests")
+          if "/configure" in purple_log:
+              fail("participant attempted to configure the mock")
+
+          (run_dir / "data-hashes.json").write_text(
+              json.dumps(hashes, indent=2, sort_keys=True) + "\n"
+          )
+          print("Exact 700/700 ComtradeBench run with live request evidence verified")
+          PY
+
+            docker rm -f comtrade-purple comtrade-green comtrade-mock >/dev/null
+            docker volume rm comtrade-purple-output >/dev/null
+            docker network rm comtrade-validation >/dev/null
+          done
+
+          cmp \
+            "${RUNNER_TEMP}/comtrade-run-1/data-hashes.json" \
+            "${RUNNER_TEMP}/comtrade-run-2/data-hashes.json"
+
+      - name: Preserve exact-run evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comtrade-exact-2x7-linux-amd64
+          path: |
+            ${{ runner.temp }}/comtrade-run-1
+            ${{ runner.temp }}/comtrade-run-2
+          if-no-files-found: error
+
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comtrade-failure-logs
+          path: |
+            ${{ runner.temp }}/purple-cleanup.log
+            ${{ runner.temp }}/green-cleanup.log
+            ${{ runner.temp }}/mock-cleanup.log
+            ${{ runner.temp }}/comtrade-run-1
+            ${{ runner.temp }}/comtrade-run-2
+          if-no-files-found: warn
+
+      - name: Package the exact-tested image
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          actual_id=$(docker image inspect --format '{{.Id}}' \
+            comtrade-deterministic-agent:test)
+          for run_number in 1 2; do
+            test "$(cat "${RUNNER_TEMP}/comtrade-run-${run_number}/participant-image-id.txt")" = \
+              "${actual_id}"
+          done
+          printf '%s\n' "${actual_id}" > "${RUNNER_TEMP}/participant-image-id.txt"
+          docker save --output "${RUNNER_TEMP}/participant-image.tar" \
+            comtrade-deterministic-agent:test
+
+      - name: Transfer the exact-tested image
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: exact-tested-comtrade-image
+          path: |
+            ${{ runner.temp }}/participant-image.tar
+            ${{ runner.temp }}/participant-image-id.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Record validation summary
+        if: always()
+        env:
+          EXACT_OUTCOME: ${{ steps.exact.outcome }}
+        run: |
+          if [ "${EXACT_OUTCOME}" = "success" ]; then
+            echo "ComtradeBench exact gate: 1400/1400 across two fresh full-stack assessments" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "ComtradeBench exact gate did not complete successfully" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  publish:
+    needs: validate
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download exact-tested image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: exact-tested-comtrade-image
+          path: ${{ runner.temp }}/exact-tested-image
+
+      - name: Load and verify transferred image
+        run: |
+          docker load --input "${RUNNER_TEMP}/exact-tested-image/participant-image.tar"
+          expected_id=$(cat "${RUNNER_TEMP}/exact-tested-image/participant-image-id.txt")
+          actual_id=$(docker image inspect --format '{{.Id}}' \
+            comtrade-deterministic-agent:test)
+          test "${actual_id}" = "${expected_id}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish exact-tested image
+        id: publish
+        run: |
+          docker tag comtrade-deterministic-agent:test \
+            "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker pull "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          digest_ref=$(docker inspect --format='{{index .RepoDigests 0}}' \
+            "${IMAGE_NAME}:sha-${GITHUB_SHA}")
+          case "${digest_ref}" in
+            "${IMAGE_NAME}@sha256:"*) ;;
+            *) echo "Unexpected digest: ${digest_ref}" >&2; exit 1 ;;
+          esac
+          expected_id=$(cat "${RUNNER_TEMP}/exact-tested-image/participant-image-id.txt")
+          docker image rm "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            comtrade-deterministic-agent:test
+          docker pull "${digest_ref}"
+          test "$(docker image inspect --format '{{.Id}}' "${digest_ref}")" = \
+            "${expected_id}"
+          sed -E \
+            "s#${IMAGE_NAME}@sha256:(REPLACE_WITH_PUBLISHED_DIGEST|[0-9a-f]{64})#${digest_ref}#" \
+            amber-manifest.json5 \
+            > "${RUNNER_TEMP}/amber-manifest.published.json5"
+          grep --fixed-strings --quiet "image: \"${digest_ref}\"," \
+            "${RUNNER_TEMP}/amber-manifest.published.json5"
+          docker tag "${digest_ref}" "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:latest"
+          echo "digest=${digest_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preserve digest-pinned registration manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comtrade-release-manifest
+          path: ${{ runner.temp }}/amber-manifest.published.json5
+          if-no-files-found: error
+
+      - name: Record publishing summary
+        env:
+          PUBLISHED_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          echo "Published exact-tested image: ${PUBLISHED_DIGEST}" \
+            >> "${GITHUB_STEP_SUMMARY}"

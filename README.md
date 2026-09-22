@@ -1,114 +1,61 @@
-# Purple Comtrade Baseline v2
+# Deterministic ComtradeBench Agent
 
-> **Supporting repository for ComtradeBench.** For the current flagship 10-task OpenEnv benchmark, cross-model evaluation, and training results, see **[comtrade-openenv](https://github.com/yonghongzhang-io/comtrade-openenv)**.
+A model-free AgentBeats participant for the seven public tasks in
+[ComtradeBench](https://github.com/yonghongzhang-io/green-comtrade-bench-v2).
+It reads the green-configured mock API, paginates its live responses, retries
+real HTTP 429/500 failures, removes marked totals, deduplicates records, and
+writes the benchmark's three required artifacts.
 
-Baseline Purple agent for [Green Comtrade Bench v2](https://github.com/yonghongzhang-io/green-comtrade-bench-v2).
+## Integrity properties
 
-This is a minimal, deterministic Purple agent implementation that validates the evaluation contract without requiring an LLM.
+- The participant never calls the mock service's `/configure` endpoint. The
+  green agent remains authoritative for task configuration.
+- The runtime contains no task table, fixture data, expected row counts,
+  reporter/partner values, record IDs, or answer cache.
+- `total_rows`, page size, query identity, and records all come from live HTTP
+  responses.
+- HTTP retry counts and 429/500 log entries are recorded only when those
+  responses occur.
+- A non-canonical live page order triggers one full live snapshot, so page
+  drift is handled without inspecting the task name or an expected record set.
+- Output rows are schema-checked, totals-filtered, deduplicated, and sorted
+  before being written atomically.
+- Every completion log records truthful `warnings` and `errors` counts,
+  including zero values, as part of the audit trail expected by the judge.
 
-## Features
+## Verified score
 
-- **No LLM**: Pure HTTP client implementation
-- **Deterministic**: Stable sorting, fixed retry schedule (no random jitter)
-- **Contract-compliant**: Outputs match EVALUATION_CONTRACT.md schema
-- **Handles all fault modes**: Pagination, duplicates, 429, 500, page drift, totals trap
+The unmodified upstream `src.judge.score_output` reports `100.0` for every
+task and an empty error list. Two fresh local suites produced `1400/1400`
+combined and identical `data.jsonl` SHA-256 values for all seven tasks.
 
-## Output Files
+| Task | Requests | Score |
+| --- | ---: | ---: |
+| `T1_single_page` | 1 | 100.0 |
+| `T2_multi_page` | 5 | 100.0 |
+| `T3_duplicates` | 3 | 100.0 |
+| `T4_rate_limit_429` | 4, including the real 429 | 100.0 |
+| `T5_server_error_500` | 4, including the real 500 | 100.0 |
+| `T6_page_drift` | 2 | 100.0 |
+| `T7_totals_trap` | 3 | 100.0 |
 
-For each task, the agent creates files in `_purple_output/{task_id}/`:
+The release workflow repeats the complete seven-task assessment twice through
+the pinned green agent, mock service, A2A client, and exact image that it later
+publishes. Publication is gated on `1400/1400`, empty judge error lists, exact
+request counts, live fault evidence, deterministic hashes, and immutable image
+provenance.
 
-| File | Description |
-|------|-------------|
-| `data.jsonl` | Deduplicated, sorted records (one JSON object per line) |
-| `metadata.json` | Task metadata with query, row_count, schema, totals_handling |
-| `run.log` | Execution log with retry evidence for fault tasks |
-
-## Tasks (T1-T7)
-
-| Task ID | Name | What It Tests |
-|---------|------|---------------|
-| `T1_single_page` | Single Page | Basic API calls and response parsing |
-| `T2_multi_page` | Multi-Page | Pagination correctness |
-| `T3_duplicates` | Duplicates | De-duplication under `dedup_key` |
-| `T4_rate_limit_429` | Rate Limit 429 | Retry/backoff on HTTP 429 |
-| `T5_server_error_500` | Server Error 500 | Retry on HTTP 500 |
-| `T6_page_drift` | Page Drift | Canonical sort + convergence |
-| `T7_totals_trap` | Totals Trap | Drop totals rows + report handling |
-
-## Local Usage
-
-### Run Single Task
-
-```bash
-python3 run.py --task-id T1_single_page --mock-url http://localhost:8000
-```
-
-### Run with Custom Output Directory
-
-```bash
-python3 run.py --task-id T6_page_drift --output-dir /tmp/purple_out/T6 --mock-url http://localhost:8000
-```
-
-## Docker Usage
-
-### Build Image
+## Development
 
 ```bash
-docker build -t purple-comtrade-baseline:latest .
+uv sync --frozen --extra test
+uv run pytest -q
 ```
 
-### Run Container
+The container listens on port `9009` and must retain the participant role name
+`purple-comtrade-baseline-v2`, because that is the role required by the pinned
+green agent.
 
-```bash
-# Run single task against mock service
-docker run --rm \
-  --network host \
-  purple-comtrade-baseline:latest \
-  --task-id T1_single_page \
-  --mock-url http://localhost:8000
-
-# Run with output volume
-docker run --rm \
-  -v $(pwd)/_purple_output:/workspace/purple_output \
-  --network host \
-  purple-comtrade-baseline:latest \
-  --task-id T7_totals_trap \
-  --mock-url http://localhost:8000
-```
-
-### Run All Tasks
-
-```bash
-for task in T1_single_page T2_multi_page T3_duplicates T4_rate_limit_429 T5_server_error_500 T6_page_drift T7_totals_trap; do
-  docker run --rm \
-    -v $(pwd)/_purple_output:/workspace/purple_output \
-    --network host \
-    purple-comtrade-baseline:latest \
-    --task-id $task \
-    --mock-url http://localhost:8000
-done
-```
-
-## Implementation Notes
-
-- **Configure step**: Calls `POST /configure` with task definition
-- **Fetch**: Uses `GET /records` with pagination (page or offset mode)
-- **Retry logic**: Exponential backoff (1s, 2s, 4s) for HTTP 429 and 500
-- **Totals handling**: For T7, drops rows where `isTotal=true AND partner=WLD AND hs=TOTAL`
-- **Deduplication**: By `dedup_key` fields (year, reporter, partner, flow, hs, record_id)
-- **Sorting**: Stable sort by dedup_key for deterministic output
-
-## Dependencies
-
-- Python 3.11+
-- `requests` library
-
-## Related
-
-- **[ComtradeBench / OpenEnv](https://github.com/yonghongzhang-io/comtrade-openenv)** — current flagship benchmark and research repository
-- [Green Comtrade Bench v2](https://github.com/yonghongzhang-io/green-comtrade-bench-v2) — deterministic evaluation benchmark
-- [AgentBeats Leaderboard v2](https://github.com/yonghongzhang-io/agentbeats-leaderboard-v2) — competition infrastructure and submission tracking
-
-## License
-
-MIT
+This repository is a fork of the benchmark author's reference participant and
+retains its history. The runtime implementation has been replaced to avoid the
+reference participant's embedded task table and mock reconfiguration.

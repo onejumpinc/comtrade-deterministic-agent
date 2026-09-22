@@ -1,0 +1,38 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {},
+    required: [],
+    additionalProperties: false,
+  },
+
+  program: {
+    image: "ghcr.io/onejumpinc/comtrade-deterministic-agent@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+    entrypoint: [
+      "/usr/local/bin/comtrade-entrypoint",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "9009",
+      "--card-url",
+      "http://purple-comtrade-baseline-v2:9009",
+    ],
+    env: { PYTHONUNBUFFERED: "1" },
+    network: {
+      endpoints: [{ name: "a2a_endpoint", port: 9009 }],
+    },
+  },
+
+  slots: {},
+  provides: { a2a: { kind: "a2a", endpoint: "a2a_endpoint" } },
+  exports: { a2a: "a2a" },
+
+  metadata: {
+    name: "One Jump Deterministic Comtrade Agent",
+    description: "Model-free live-API participant for the seven-task ComtradeBench suite.",
+    benchmark: "ComtradeBench",
+    participant_roles: ["purple-comtrade-baseline-v2"],
+  },
+}
